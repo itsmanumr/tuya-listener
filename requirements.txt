@@ -1,2 +1,2 @@
-pulsar-client
+tuya-iot-py-sdk
 requests
