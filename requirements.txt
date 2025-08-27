@@ -1,3 +1,2 @@
-tuya-iot-py-sdk
 pulsar-client
 requests
