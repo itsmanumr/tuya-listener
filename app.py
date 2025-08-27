@@ -22,11 +22,12 @@ def gen_token():
         msg=message.encode(),
         digestmod=hashlib.sha256
     ).hexdigest()
-    return sign, t
 
-# --- Conexión a Pulsar ---
-sign, t = gen_token()
-token = f"{ACCESS_ID}::{t}::{sign}"
+    # El formato real del token Tuya lleva también el método de firma
+    token = f"{ACCESS_ID}:{t}:{sign}:hmacSha256"
+    return token
+
+token = gen_token()
 
 print("🔌 Conectando a Tuya Pulsar en", PULSAR_URL)
 
@@ -35,8 +36,8 @@ client = pulsar.Client(
     authentication=pulsar.AuthenticationToken(token)
 )
 
-# El topic de Tuya siempre es en este formato:
-topic = f"persistent://{ACCESS_ID}/out/status"
+# --- Topic correcto para mensajes de estado ---
+topic = f"persistent://{ACCESS_ID}/out/event"
 
 consumer = client.subscribe(topic, subscription_name="railway-listener")
 
@@ -58,7 +59,7 @@ while True:
                     print("💧 Fuga detectada → apagando aire…")
                     try:
                         r = requests.get(VSH_URL, timeout=10)
-                        print("➡️ Alexa respondio:", r.status_code)
+                        print("➡️ Alexa respondió:", r.status_code)
                     except Exception as e:
                         print("❌ Error llamando a Alexa:", e)
 
