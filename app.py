@@ -2,99 +2,73 @@ import os
 import time
 import json
 import requests
-import pulsar
-import hmac
-import hashlib
+from tuya_iot import TuyaOpenAPI, AuthType
 
+# --- Variables de entorno ---
 ACCESS_ID = os.getenv("TUYA_ACCESS_ID")
 ACCESS_SECRET = os.getenv("TUYA_ACCESS_SECRET")
-PULSAR_URL = os.getenv("TUYA_PULSAR_URL")
+REGION = os.getenv("TUYA_REGION", "eu")  # 'eu' para Western Europe
+ENDPOINT = f"https://openapi.tuya{REGION}.com"
+DEVICE_ID = os.getenv("DEVICE_ID")       # <- PON AQUÍ el Device ID en Railway (variable)
 VSH_URL = os.getenv("VSH_URL")
-SUBSCRIPTION_NAME = os.getenv("SUBSCRIPTION_NAME")  # p.ej. y4kfus98qc93u8hfpjs4-sub
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))  # cada cuántos segundos consultar
 
-if not all([ACCESS_ID, ACCESS_SECRET, PULSAR_URL, VSH_URL, SUBSCRIPTION_NAME]):
-    raise RuntimeError("Faltan variables de entorno. Revisa TUYA_ACCESS_ID/SECRET, TUYA_PULSAR_URL, VSH_URL, SUBSCRIPTION_NAME")
+if not all([ACCESS_ID, ACCESS_SECRET, DEVICE_ID, VSH_URL]):
+    raise RuntimeError("Faltan variables: TUYA_ACCESS_ID, TUYA_ACCESS_SECRET, DEVICE_ID, VSH_URL")
 
-def now_ms():
-    return str(int(time.time() * 1000))
+# --- Cliente Tuya OpenAPI ---
+openapi = TuyaOpenAPI(ENDPOINT, ACCESS_ID, ACCESS_SECRET, AuthType.CUSTOM)
+openapi.connect()
+print("✅ Conectado a Tuya OpenAPI:", ENDPOINT)
 
-def sign_hex_upper(key: str, msg: str) -> str:
-    return hmac.new(key.encode(), msg=msg.encode(), digestmod=hashlib.sha256).hexdigest().upper()
+# Recordar último estado para no disparar repetido
+last_leak = None
 
-def build_tokens():
+def read_leak_status():
     """
-    Tuya usa distintos formatos de token según la versión del tenant.
-    Probamos varios hasta que funcione.
+    Lee el estado del sensor por API.
+    Devuelve True si hay fuga, False si no, None si no se encuentra el código.
     """
-    t = now_ms()
-    s = sign_hex_upper(ACCESS_SECRET, ACCESS_ID + t)
+    path = f"/v1.0/devices/{DEVICE_ID}/status"
+    res = openapi.get(path)
+    # Estructura esperada: {'code': 200, 'success': True, 'result': [{'code':'water_leak','value':False}, ...]}
+    if not res or not res.get("success"):
+        print("⚠️ Respuesta API no válida:", res)
+        return None
 
-    candidates = [
-        # 1) Formato v2 clásico
-        f"v2/{ACCESS_ID}/{t}/{s}",
-        # 2) v2 + método
-        f"v2/{ACCESS_ID}/{t}/{s}|signMethod=hmacSha256",
-        # 3) Formato con separadores ':'
-        f"{ACCESS_ID}:{t}:{s}",
-        # 4) Con método al final
-        f"{ACCESS_ID}:{t}:{s}:hmacSha256",
-    ]
-    return candidates
+    statuses = res.get("result", [])
+    leak = None
+    # Códigos típicos de sensores de agua en Tuya
+    for st in statuses:
+        code = st.get("code")
+        value = st.get("value")
+        if code in ("water_leak", "watersensor_state", "alarm", "flood"):
+            leak = bool(value)
+            break
 
-def try_connect_with_token(token: str):
-    print(f"🔑 Probando token: {token[:20]}... (oculto)")
-    client = pulsar.Client(
-        service_url=PULSAR_URL,
-        authentication=pulsar.AuthenticationToken(token),
-        operation_timeout_seconds=10,
-        io_threads=1,
-        message_listener_threads=1,
-    )
-    topic = f"persistent://{ACCESS_ID}/out/event"
-    print("➡️ Topic:", topic)
-    print("➡️ Subscription:", SUBSCRIPTION_NAME)
+    return leak
 
-    consumer = client.subscribe(topic, subscription_name=SUBSCRIPTION_NAME)
-    print("✅ Suscrito OK con este token")
-    return client, consumer
-
-# ---------- Conexión con prueba de formatos ----------
-client = None
-consumer = None
-last_err = None
-
-for token in build_tokens():
-    try:
-        client, consumer = try_connect_with_token(token)
-        break
-    except Exception as e:
-        last_err = e
-        print("❌ Fallo suscribiendo con este token:", e)
-        time.sleep(1)
-
-if consumer is None:
-    raise RuntimeError(f"No fue posible suscribirse a Tuya Pulsar. Último error: {last_err}")
-
-# ---------- Loop principal ----------
 while True:
-    msg = consumer.receive()
     try:
-        payload = json.loads(msg.data())
-        print("📩 Evento:", json.dumps(payload, indent=2))
+        leak = read_leak_status()
+        if leak is None:
+            print("ℹ️ No encontré código de fuga en el dispositivo (aún). Reintentando...")
+        else:
+            if last_leak is None:
+                last_leak = leak
 
-        if isinstance(payload, dict) and "status" in payload:
-            for st in payload.get("status", []):
-                code = st.get("code")
-                value = st.get("value")
-                if code in ["water_leak", "watersensor_state", "alarm", "flood"] and value:
-                    print("💧 Fuga detectada → apagando aire…")
-                    try:
-                        r = requests.get(VSH_URL, timeout=10)
-                        print("➡️ Alexa respondió:", r.status_code)
-                    except Exception as e:
-                        print("❌ Error llamando a Alexa:", e)
+            if leak and not last_leak:
+                print("💧 Fuga detectada → llamo a Alexa…")
+                try:
+                    r = requests.get(VSH_URL, timeout=10)
+                    print("➡️ Alexa respondió:", r.status_code)
+                except Exception as e:
+                    print("❌ Error llamando a Alexa:", e)
 
-        consumer.acknowledge(msg)
+            last_leak = leak
+
+        time.sleep(POLL_SECONDS)
+
     except Exception as e:
-        print("⚠️ Error procesando mensaje:", e)
-        consumer.negative_acknowledge(msg)
+        print("❌ Error en bucle principal:", e)
+        time.sleep(POLL_SECONDS)
