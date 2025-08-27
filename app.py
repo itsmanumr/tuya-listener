@@ -6,62 +6,86 @@ import pulsar
 import hmac
 import hashlib
 
-# --- Variables de entorno ---
 ACCESS_ID = os.getenv("TUYA_ACCESS_ID")
 ACCESS_SECRET = os.getenv("TUYA_ACCESS_SECRET")
 PULSAR_URL = os.getenv("TUYA_PULSAR_URL")
 VSH_URL = os.getenv("VSH_URL")
-SUBSCRIPTION_NAME = os.getenv("SUBSCRIPTION_NAME")  # ej: y4kfus98qc93u8hfpjs4-sub
+SUBSCRIPTION_NAME = os.getenv("SUBSCRIPTION_NAME")  # p.ej. y4kfus98qc93u8hfpjs4-sub
 
-if not SUBSCRIPTION_NAME:
-    raise RuntimeError("Falta SUBSCRIPTION_NAME (pon el nombre exacto de Subscription en Tuya).")
+if not all([ACCESS_ID, ACCESS_SECRET, PULSAR_URL, VSH_URL, SUBSCRIPTION_NAME]):
+    raise RuntimeError("Faltan variables de entorno. Revisa TUYA_ACCESS_ID/SECRET, TUYA_PULSAR_URL, VSH_URL, SUBSCRIPTION_NAME")
 
-# --- Token Tuya (HMAC-SHA256 en HEX MAYÚSCULAS) ---
-def gen_token():
-    t = str(int(time.time() * 1000))
-    msg = (ACCESS_ID + t).encode()
-    key = ACCESS_SECRET.encode()
-    sign = hmac.new(key, msg=msg, digestmod=hashlib.sha256).hexdigest().upper()
-    # Formato de token usado por Tuya Token Auth
-    return f"{ACCESS_ID}:{t}:{sign}:hmacSha256"
+def now_ms():
+    return str(int(time.time() * 1000))
 
-token = gen_token()
+def sign_hex_upper(key: str, msg: str) -> str:
+    return hmac.new(key.encode(), msg=msg.encode(), digestmod=hashlib.sha256).hexdigest().upper()
 
-print("🔌 Conectando a Tuya Pulsar en", PULSAR_URL)
-client = pulsar.Client(
-    service_url=PULSAR_URL,
-    authentication=pulsar.AuthenticationToken(token)
-)
+def build_tokens():
+    """
+    Tuya usa distintos formatos de token según la versión del tenant.
+    Probamos varios hasta que funcione.
+    """
+    t = now_ms()
+    s = sign_hex_upper(ACCESS_SECRET, ACCESS_ID + t)
 
-# Topic correcto
-topic = f"persistent://{ACCESS_ID}/out/event"
-print("➡️ Topic:", topic)
-print("➡️ Subscription:", SUBSCRIPTION_NAME)
+    candidates = [
+        # 1) Formato v2 clásico
+        f"v2/{ACCESS_ID}/{t}/{s}",
+        # 2) v2 + método
+        f"v2/{ACCESS_ID}/{t}/{s}|signMethod=hmacSha256",
+        # 3) Formato con separadores ':'
+        f"{ACCESS_ID}:{t}:{s}",
+        # 4) Con método al final
+        f"{ACCESS_ID}:{t}:{s}:hmacSha256",
+    ]
+    return candidates
 
-# Intentos de suscripción con reintentos suaves
-for attempt in range(1, 8):
+def try_connect_with_token(token: str):
+    print(f"🔑 Probando token: {token[:20]}... (oculto)")
+    client = pulsar.Client(
+        service_url=PULSAR_URL,
+        authentication=pulsar.AuthenticationToken(token),
+        operation_timeout_seconds=10,
+        io_threads=1,
+        message_listener_threads=1,
+    )
+    topic = f"persistent://{ACCESS_ID}/out/event"
+    print("➡️ Topic:", topic)
+    print("➡️ Subscription:", SUBSCRIPTION_NAME)
+
+    consumer = client.subscribe(topic, subscription_name=SUBSCRIPTION_NAME)
+    print("✅ Suscrito OK con este token")
+    return client, consumer
+
+# ---------- Conexión con prueba de formatos ----------
+client = None
+consumer = None
+last_err = None
+
+for token in build_tokens():
     try:
-        consumer = client.subscribe(topic, subscription_name=SUBSCRIPTION_NAME)
-        print("✅ Suscrito OK")
+        client, consumer = try_connect_with_token(token)
         break
     except Exception as e:
-        print(f"❌ Fallo suscribiendo (intento {attempt}):", e)
-        time.sleep(2 * attempt)
-else:
-    raise RuntimeError("No fue posible suscribirse al topic de Tuya.")
+        last_err = e
+        print("❌ Fallo suscribiendo con este token:", e)
+        time.sleep(1)
 
-# --- Bucle principal ---
+if consumer is None:
+    raise RuntimeError(f"No fue posible suscribirse a Tuya Pulsar. Último error: {last_err}")
+
+# ---------- Loop principal ----------
 while True:
     msg = consumer.receive()
     try:
         payload = json.loads(msg.data())
         print("📩 Evento:", json.dumps(payload, indent=2))
 
-        # Procesar estados reportados
         if isinstance(payload, dict) and "status" in payload:
-            for status in payload.get("status", []):
-                code = status.get("code")
-                value = status.get("value")
+            for st in payload.get("status", []):
+                code = st.get("code")
+                value = st.get("value")
                 if code in ["water_leak", "watersensor_state", "alarm", "flood"] and value:
                     print("💧 Fuga detectada → apagando aire…")
                     try:
